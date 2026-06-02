@@ -2,14 +2,18 @@ import asyncio
 import logging
 import random
 import string
+import re
 import urllib.parse
+from curl_cffi.requests import AsyncSession
 import aiohttp
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
 # ================= НАСТРОЙКИ =================
-BOT_TOKEN = "8628009037:AAEM-kEYQ1hcOHF7IAwr3Qm4XH3Li7Ejlfo" # <-- Вставь сюда токен своего бота
+# ⚠️ ВНИМАНИЕ: Твой старый токен засветился в чате! 
+# Обязательно зайди в @BotFather -> /revoke и вставь НОВЫЙ токен сюда:
+BOT_TOKEN = "ВСТАВЬ_СЮДА_НОВЫЙ_ТОКЕН"
 
 # Глобальные настройки (хранятся в памяти)
 SETTINGS = {
@@ -51,7 +55,6 @@ async def create_temp_email():
             
             # 2. Генерируем случайные данные для ящика
             login = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
-            # Пароль для самого почтового ящика (нужен для входа и чтения писем)
             mail_password = ''.join(random.choices(string.ascii_letters + string.digits, k=14))
             address = f"{login}@{domain}"
             
@@ -70,93 +73,112 @@ async def create_temp_email():
         logging.error(f"Ошибка mail.tm: {e}")
         return None, None, f"Сетевая ошибка: {e}"
 
-# ================= ПРОЦЕСС РЕГИСТРАЦИИ =================
+# ================= ПРОЦЕСС РЕГИСТРАЦИИ (С ОБХОДОМ DATADOME) =================
 async def register_account(ref_code: str):
+    """
+    Регистрация на twiboost.com с обходом защиты Datadome
+    Использует curl_cffi для клонирования TLS-отпечатка реального Chrome
+    """
     email, mail_pass, status = await create_temp_email()
     if not email:
         return None, f"❌ Не удалось создать почту: {status}"
         
-    # Генерация логина и пароля (под твой формат из CURL)
     login = ''.join(random.choices(string.digits, k=6))
     password = "Derver" + ''.join(random.choices(string.digits, k=6))
     
-    # Куки с реферальным ID
-    cookies = {"referral_id": ref_code}
-    
-    # Заголовки для первого шага (GET)
-    headers_get = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Connection": "keep-alive",
-        "Referer": "https://twiboost.com/",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-User": "?1",
-    }
-    
     try:
-        async with aiohttp.ClientSession(cookies=cookies) as session:
-            # ШАГ 1: Заходим на страницу регистрации, чтобы получить XSRF-TOKEN в куки
-            async with session.get("https://twiboost.com/reg", headers=headers_get) as resp:
-                pass
-                
-            # Достаем токен из кук
-            xsrf_cookie = session.cookie_jar.filter_cookies("https://twiboost.com").get("XSRF-TOKEN")
-            if not xsrf_cookie:
-                return None, "❌ Не удалось получить XSRF-TOKEN (сайт изменил защиту?)."
-                
-            # Токен в куках обычно URL-encoded, декодируем его
-            token_val = urllib.parse.unquote(xsrf_cookie.value)
+        # 🛡 Используем curl_cffi - он клонирует TLS-отпечаток реального Chrome 120
+        # Для сайта наш запрос неотличим от настоящего браузера
+        async with AsyncSession(impersonate="chrome120") as session:
             
-            # Заголовки для второго шага (POST)
+            # ШАГ 1: Заходим СРАЗУ по реферальной ссылке
+            # Это правильно поставит куку referral_id и "прогреет" сессию
+            await session.get(f"https://twiboost.com/ref{ref_code}")
+            
+            # ШАГ 2: Заходим на страницу регистрации
+            resp = await session.get("https://twiboost.com/reg")
+            html = resp.text
+            
+            # 🔍 Ищем CSRF-токен
+            token_val = None
+            
+            # Вариант 1: <meta name="csrf-token" content="...">
+            match = re.search(r'<meta\s+name="csrf-token"\s+content="([^"]+)"', html)
+            if match:
+                token_val = match.group(1)
+            
+            # Вариант 2: window.Laravel = {"csrfToken":"..."}
+            if not token_val:
+                match = re.search(r'csrfToken["\s:]+["\']([^"\']+)["\']', html)
+                if match:
+                    token_val = match.group(1)
+                    
+            # Вариант 3: <input type="hidden" name="_token" value="...">
+            if not token_val:
+                match = re.search(r'name="_token"\s+value="([^"]+)"', html)
+                if match:
+                    token_val = match.group(1)
+            
+            # Вариант 4: Если в HTML нет — берем из куки XSRF-TOKEN
+            if not token_val:
+                xsrf = session.cookies.get("XSRF-TOKEN")
+                if xsrf:
+                    token_val = urllib.parse.unquote(xsrf)
+            
+            # Если токен так и не нашли — проверяем, показали ли нам форму регистрации
+            if not token_val:
+                if "Создать аккаунт" not in html and "Пароль" not in html:
+                    return None, f"❌ Сайт не показал форму регистрации. Возможно, капча Datadome. HTML:\n\n{html[:400]}"
+            
+            # ШАГ 3: Отправляем POST-запрос на регистрацию
             headers_post = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0",
                 "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
                 "Content-Type": "application/json",
                 "X-Site-Host": "twiboost.com",
-                "X-XSRF-TOKEN": token_val,
                 "Origin": "https://twiboost.com",
-                "Connection": "keep-alive",
                 "Referer": "https://twiboost.com/reg",
                 "Sec-Fetch-Dest": "empty",
                 "Sec-Fetch-Mode": "cors",
                 "Sec-Fetch-Site": "same-origin",
             }
             
+            # Если токен нашли — добавляем его в заголовок
+            if token_val:
+                headers_post["X-XSRF-TOKEN"] = token_val
+                
             payload = {
                 "login": login,
                 "email": email,
                 "password": password
             }
             
-            # ШАГ 2: Отправляем данные на API регистрации
-            async with session.post("https://twiboost.com/api/register", json=payload, headers=headers_post) as resp:
-                result = await resp.text()
-                
-                # Возвращаем данные, включая пароль от временной почты
-                account_data = {
-                    "twiboost_email": email,
-                    "mailbox_password": mail_pass, # <-- Пароль от самой почты
-                    "twiboost_login": login,
-                    "twiboost_password": password,
-                    "response": result
-                }
-                return account_data, "Success"
-                
+            resp_post = await session.post(
+                "https://twiboost.com/api/register", 
+                json=payload, 
+                headers=headers_post
+            )
+            result = resp_post.text
+            
+            account_data = {
+                "twiboost_email": email,
+                "mailbox_password": mail_pass,
+                "twiboost_login": login,
+                "twiboost_password": password,
+                "response": result
+            }
+            return account_data, "Success"
+            
     except Exception as e:
-        logging.error(f"Ошибка сети при регистрации: {e}")
-        return None, f"❌ Сетевая ошибка: {e}"
+        logging.error(f"Ошибка curl_cffi: {e}")
+        return None, f"❌ Ошибка: {type(e).__name__}: {e}"
 
 # ================= ХЕНДЛЕРЫ БОТА =================
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
         "👋 Привет! Я бот для авторега на twiboost.com.\n"
-        "🛡️ *Почта:* Теперь используется надежный сервис `mail.tm`.\n\n"
+        "🛡️ *Почта:* надежный сервис `mail.tm`\n"
+        "🛡️ *Защита:* обход Datadome через `curl_cffi`\n\n"
         "📋 *Команды:*\n"
         "/test - Сделать 1 регистрацию для проверки\n"
         "/auto - Запустить авторег (интервал 5-60 мин)\n"
@@ -168,20 +190,27 @@ async def cmd_start(message: Message):
 @router.message(Command("settings"))
 async def cmd_settings(message: Message):
     status = "🟢 Вкл" if SETTINGS["auto_mode"] else "🔴 Выкл"
-    await message.answer(f"⚙️ *Настройки:*\nРеф. код: `{SETTINGS['ref_code']}`\nАвторежим: {status}", parse_mode="Markdown")
+    await message.answer(
+        f"⚙️ *Настройки:*\n"
+        f"Реф. код: `{SETTINGS['ref_code']}`\n"
+        f"Авторежим: {status}", parse_mode="Markdown"
+    )
 
 @router.message(Command("setref"))
 async def cmd_setref(message: Message):
     args = message.text.split()
     if len(args) > 1:
         SETTINGS["ref_code"] = args[1]
-        await message.answer(f"✅ Реферальный код обновлен на: `{SETTINGS['ref_code']}`", parse_mode="Markdown")
+        await message.answer(
+            f"✅ Реферальный код обновлен на: `{SETTINGS['ref_code']}`", 
+            parse_mode="Markdown"
+        )
     else:
         await message.answer("⚠️ Использование: `/setref 3720781`", parse_mode="Markdown")
 
 @router.message(Command("test"))
 async def cmd_test(message: Message):
-    wait_msg = await message.answer("⏳ Генерирую надежную почту и запускаю тестовую регистрацию...")
+    wait_msg = await message.answer("⏳ Генерирую почту и запускаю тестовую регистрацию...")
     data, status = await register_account(SETTINGS["ref_code"])
     
     if status == "Success":
@@ -191,10 +220,10 @@ async def cmd_test(message: Message):
             f"📧 Email: `{data['twiboost_email']}`\n"
             f"👤 Login: `{data['twiboost_login']}`\n"
             f"🔑 Password: `{data['twiboost_password']}`\n\n"
-            f"📬 *Данные от временной почты (для подтверждения):*\n"
+            f"📬 *Вход во временную почту (mail.tm):*\n"
             f"🔗 Сайт: `https://mail.tm`\n"
             f"🔑 Mail Pass: `{data['mailbox_password']}`\n\n"
-            f"📦 *Ответ сервера:*\n`{data['response'][:200]}`", parse_mode="Markdown"
+            f"📦 *Ответ сервера:*\n`{data['response'][:300]}`", parse_mode="Markdown"
         )
     else:
         await wait_msg.edit_text(f"❌ Ошибка: {status}")
@@ -271,12 +300,13 @@ if __name__ == "__main__":
         print(">>> 1. Скрипт запущен. Проверяю библиотеки...")
         import aiogram
         import aiohttp
-        print(">>> 2. Библиотеки на месте. Подключаюсь к Telegram...")
+        from curl_cffi.requests import AsyncSession
+        print(">>> 2. Все библиотеки на месте. Подключаюсь к Telegram...")
         
         logging.basicConfig(level=logging.INFO)
         asyncio.run(main())
         
-        print(">>> 3. Бот остановлен (этого не должно происходить так быстро).")
+        print(">>> 3. Бот остановлен.")
     except Exception as e:
         print("\n" + "="*50)
         print(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {type(e).__name__}")
