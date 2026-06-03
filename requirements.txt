@@ -1,3 +1,2 @@
-aiogram
-aiohttp
-curl_cffi
+pyrogram
+tgcrypto
